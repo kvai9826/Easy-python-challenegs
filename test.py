@@ -1,6 +1,5 @@
 import streamlit as st
 import sqlite3
-import hashlib
 import imagehash
 from PIL import Image
 import torch
@@ -14,19 +13,23 @@ import uuid
 # Device & CLIP Setup
 # ----------------------------
 device = "cuda" if torch.cuda.is_available() else "cpu"
+clip_model_path = os.path.abspath("./clip_model_offline")  # Offline CLIP folder
 
-# Folder where you have downloaded CLIP model
-clip_model_path = os.path.abspath("./clip_model_offline")
-
-# Load CLIP offline
 model = CLIPModel.from_pretrained(clip_model_path, local_files_only=True).to(device)
 processor = CLIPProcessor.from_pretrained(clip_model_path, local_files_only=True)
 
 # ----------------------------
 # Database Setup
 # ----------------------------
-conn = sqlite3.connect("claims.db", check_same_thread=False)
+DB_FILE = "claims.db"
+IMAGE_FOLDER = "./images"
+
+os.makedirs(IMAGE_FOLDER, exist_ok=True)
+
+conn = sqlite3.connect(DB_FILE, check_same_thread=False)
 c = conn.cursor()
+
+# Create table if not exists with damage_class column
 c.execute("""
 CREATE TABLE IF NOT EXISTS records (
     unique_image_id TEXT,
@@ -34,6 +37,7 @@ CREATE TABLE IF NOT EXISTS records (
     order_id TEXT,
     marketplace TEXT,
     description TEXT,
+    damage_class TEXT,
     image_hash TEXT,
     embedding BLOB
 )
@@ -44,14 +48,18 @@ conn.commit()
 # Utility Functions
 # ----------------------------
 def generate_unique_image_id():
-    """Generate truly unique ID for a new unique image"""
     return str(uuid.uuid4())[:8]
 
 def get_image_hash(image):
     return str(imagehash.phash(image))
 
+def save_image(image, image_hash):
+    """Save uploaded image to images folder"""
+    path = os.path.join(IMAGE_FOLDER, f"{image_hash}.png")
+    image.save(path)
+    return path
+
 def get_embedding(image, description):
-    """Compute joint embedding of image + description (offline)"""
     inputs = processor(text=[description], images=image, return_tensors="pt", padding=True)
     pixel_values = inputs["pixel_values"].to(device)
     input_ids = inputs["input_ids"].to(device)
@@ -68,7 +76,6 @@ def cosine_similarity(a, b):
     return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
 
 def check_duplicates(image, description):
-    """Check if image matches any existing cluster"""
     image_hash = get_image_hash(image)
     new_embedding = get_embedding(image, description)
 
@@ -76,29 +83,27 @@ def check_duplicates(image, description):
     all_records = c.fetchall()
 
     for rec in all_records:
-        uid, cust_id, ord_id, market, desc, stored_hash, stored_emb = rec
+        uid, _, _, _, _, _, stored_hash, stored_emb = rec
 
-        # Exact duplicate
         if stored_hash == image_hash:
             return ("Exact Duplicate", uid)
 
-        # Similar image
         sim = cosine_similarity(new_embedding, stored_emb)
         if sim > 0.85:
             return ("Similar Image", uid)
-
-        # Same narrative
         if sim > 0.65:
             return ("Same Narrative", uid)
 
     return ("No Duplicate", None)
 
-def save_to_db(unique_image_id, customer_id, order_id, marketplace, description, image):
-    """Save record into database; link to cluster if duplicate"""
+def save_to_db(unique_image_id, customer_id, order_id, marketplace, description, damage_class, image):
     image_hash = get_image_hash(image)
+    save_image(image, image_hash)
     embedding = get_embedding(image, description)
-    c.execute("INSERT INTO records VALUES (?,?,?,?,?,?,?)",
-              (unique_image_id, customer_id, order_id, marketplace, description, image_hash, embedding))
+    c.execute(
+        "INSERT INTO records VALUES (?,?,?,?,?,?,?,?)",
+        (unique_image_id, customer_id, order_id, marketplace, description, damage_class, image_hash, embedding)
+    )
     conn.commit()
 
 # ----------------------------
@@ -106,8 +111,7 @@ def save_to_db(unique_image_id, customer_id, order_id, marketplace, description,
 # ----------------------------
 st.sidebar.title("📌 Navigation")
 menu = st.sidebar.radio("Go to:", ["Submit Claim", "Database Viewer"])
-
-st.title("Duplicate image identification and clustering")
+st.title("Duplicate Image detection and Clustering")
 
 # ----------------------------
 # Submit Claim
@@ -117,24 +121,27 @@ if menu == "Submit Claim":
     order_id_input = st.text_input("Order ID")
     marketplace_input = st.text_input("Marketplace")
     description_input = st.text_area("Image Description")
+
+    damage_options = [
+        "Burnt", "Spilled", "Broken", "Scratched", "Missing Parts",
+        "Bent", "Malfunctioning", "Stained", "Packaging Damaged", "Expired", "Leaking", "Other"
+    ]
+    damage_input = st.selectbox("Damage Classification", damage_options)
+
     uploaded_file = st.file_uploader("Upload Image", type=["png", "jpg", "jpeg"])
 
     if uploaded_file and st.button("Check for Duplicates"):
         image_input = Image.open(uploaded_file).convert("RGB")
-
-        # Check for duplicates
         status, matched_uid = check_duplicates(image_input, description_input)
 
         if status == "No Duplicate":
-            # Create new unique image ID
             new_uid = generate_unique_image_id()
             save_to_db(new_uid, customer_id_input, order_id_input, marketplace_input,
-                       description_input, image_input)
+                       description_input, damage_input, image_input)
             st.success(f"✅ No duplicate found. Stored under Unique Image ID: {new_uid}")
         else:
-            # Link current claim to existing unique image ID
             save_to_db(matched_uid, customer_id_input, order_id_input, marketplace_input,
-                       description_input, image_input)
+                       description_input, damage_input, image_input)
             st.warning(f"⚠️ {status} found! Claim linked to existing Unique Image ID: {matched_uid}")
 
 # ----------------------------
@@ -143,15 +150,42 @@ if menu == "Submit Claim":
 elif menu == "Database Viewer":
     st.subheader("📂 Stored Claims in Database")
 
-    c.execute("SELECT unique_image_id, customer_id, order_id, marketplace, description FROM records")
+    c.execute("SELECT unique_image_id, customer_id, order_id, marketplace, description, damage_class, image_hash FROM records")
     rows = c.fetchall()
 
     if rows:
-        df = pd.DataFrame(rows, columns=["Unique Image ID", "Customer ID", "Order ID", "Marketplace", "Description"])
-        grouped = df.groupby("Unique Image ID")
+        df = pd.DataFrame(rows, columns=[
+            "Unique Image ID", "Customer ID", "Order ID", "Marketplace", "Description", "Damage", "Image Hash"
+        ])
 
-        for uid, group in grouped:
-            st.markdown(f"###  Unique Image ID: {uid}")
-            st.table(group[["Customer ID", "Order ID", "Marketplace", "Description"]])
-    else:
-        st.info("No records found in database.")
+        unique_ids = df["Unique Image ID"].unique()
+
+        for uid in unique_ids:
+            st.markdown(f"### Unique Image ID: {uid}")
+            group = df[df["Unique Image ID"] == uid]
+
+    # Header
+    col1, col2, col3, col4, col5, col6 = st.columns([1, 1, 1, 3, 1, 1])
+    col1.markdown("**Customer ID**")
+    col2.markdown("**Order ID**")
+    col3.markdown("**Marketplace**")
+    col4.markdown("**Description**")
+    col5.markdown("**Damage**")
+    col6.markdown("**Image**")
+
+    # Display records
+    for _, row in group.iterrows():
+        col1, col2, col3, col4, col5, col6 = st.columns([1, 1, 1, 3, 1, 1])
+        col1.write(row["Customer ID"])
+        col2.write(row["Order ID"])
+        col3.write(row["Marketplace"])
+        col4.write(row["Description"])
+        col5.write(row["Damage"])
+
+        image_path = os.path.join(IMAGE_FOLDER, f"{row['Image Hash']}.png")
+        if os.path.exists(image_path):
+            col6.image(image_path, width=60)
+        else:
+            col6.write("No image")
+else:
+    st.info("No records found in database.")
