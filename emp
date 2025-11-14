@@ -1,0 +1,528 @@
+# app.py
+import streamlit as st
+import sqlite3
+import os
+from datetime import datetime, date
+import pandas as pd
+import hashlib
+from PIL import Image
+import io
+import base64
+
+# ---------- CONFIG ----------
+DB_PATH = "employees.db"
+PHOTOS_DIR = "photos"
+ADMIN_EMP_ID = "admin"
+ADMIN_PASSWORD = "admin"  # default admin password; will be hashed and stored on first run
+
+# ---------- UTILITIES ----------
+def ensure_dirs():
+    if not os.path.exists(PHOTOS_DIR):
+        os.makedirs(PHOTOS_DIR)
+
+def get_db_conn():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+# ---------- DB INIT ----------
+def init_db(conn):
+    cur = conn.cursor()
+    # Employees
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS employees (
+        id INTEGER PRIMARY KEY,
+        emp_id TEXT UNIQUE,
+        name TEXT,
+        photo_path TEXT,
+        manager_emp_id TEXT,
+        skip_details TEXT,
+        is_admin INTEGER DEFAULT 0,
+        password_hash TEXT
+    )
+    """)
+    # Attendance
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS attendance (
+        id INTEGER PRIMARY KEY,
+        emp_id TEXT,
+        date TEXT,
+        in_time TEXT,
+        out_time TEXT,
+        status TEXT,
+        notes TEXT,
+        UNIQUE(emp_id, date)
+    )
+    """)
+    # Talent reviews
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS talent_reviews (
+        id INTEGER PRIMARY KEY,
+        emp_id TEXT,
+        period TEXT,
+        reviewer_emp_id TEXT,
+        rating INTEGER,
+        comments TEXT,
+        created_at TEXT
+    )
+    """)
+    # Leaves
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS leaves (
+        id INTEGER PRIMARY KEY,
+        emp_id TEXT,
+        start_date TEXT,
+        end_date TEXT,
+        leave_type TEXT,
+        status TEXT,
+        approver_emp_id TEXT,
+        comments TEXT,
+        applied_at TEXT
+    )
+    """)
+    # Stakeholder feedback
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS feedback (
+        id INTEGER PRIMARY KEY,
+        emp_id TEXT,
+        stakeholder TEXT,
+        feedback_text TEXT,
+        feedback_date TEXT
+    )
+    """)
+    conn.commit()
+
+    # Create default admin if missing
+    cur.execute("SELECT * FROM employees WHERE emp_id=?", (ADMIN_EMP_ID,))
+    if cur.fetchone() is None:
+        cur.execute("""INSERT INTO employees (emp_id, name, is_admin, password_hash, manager_emp_id, skip_details)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (ADMIN_EMP_ID, "Administrator", 1, hash_password(ADMIN_PASSWORD), "", ""))
+        conn.commit()
+
+# ---------- CRUD FUNCTIONS ----------
+def add_employee(conn, emp_id, name, photo_bytes, manager_emp_id, skip_details, password=None, is_admin=0):
+    cur = conn.cursor()
+    photo_path = None
+    if photo_bytes:
+        # save photo
+        filename = f"{emp_id}_{int(datetime.now().timestamp())}.png"
+        path = os.path.join(PHOTOS_DIR, filename)
+        with open(path, "wb") as f:
+            f.write(photo_bytes)
+        photo_path = path
+    pwd_hash = hash_password(password) if password else None
+    try:
+        cur.execute("""INSERT INTO employees (emp_id, name, photo_path, manager_emp_id, skip_details, is_admin, password_hash)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (emp_id, name, photo_path, manager_emp_id, skip_details, is_admin, pwd_hash))
+        conn.commit()
+        return True, "Employee added"
+    except sqlite3.IntegrityError as e:
+        return False, f"Error: {e}"
+
+def update_employee(conn, emp_id, name=None, photo_bytes=None, manager_emp_id=None, skip_details=None, password=None, is_admin=None):
+    cur = conn.cursor()
+    cur_emp = cur.execute("SELECT * FROM employees WHERE emp_id=?", (emp_id,)).fetchone()
+    if not cur_emp:
+        return False, "Employee not found"
+
+    photo_path = cur_emp["photo_path"]
+    if photo_bytes:
+        filename = f"{emp_id}_{int(datetime.now().timestamp())}.png"
+        path = os.path.join(PHOTOS_DIR, filename)
+        with open(path, "wb") as f:
+            f.write(photo_bytes)
+        photo_path = path
+
+    new_name = name if name is not None else cur_emp["name"]
+    new_manager = manager_emp_id if manager_emp_id is not None else cur_emp["manager_emp_id"]
+    new_skip = skip_details if skip_details is not None else cur_emp["skip_details"]
+    new_pwd = hash_password(password) if password else cur_emp["password_hash"]
+    new_admin = is_admin if is_admin is not None else cur_emp["is_admin"]
+
+    cur.execute("""UPDATE employees SET name=?, photo_path=?, manager_emp_id=?, skip_details=?, password_hash=?, is_admin=?
+                   WHERE emp_id=?""",
+                (new_name, photo_path, new_manager, new_skip, new_pwd, new_admin, emp_id))
+    conn.commit()
+    return True, "Updated"
+
+def get_employee(conn, emp_id):
+    cur = conn.cursor()
+    r = cur.execute("SELECT * FROM employees WHERE emp_id=?", (emp_id,)).fetchone()
+    return r
+
+def list_employees(conn):
+    cur = conn.cursor()
+    rows = cur.execute("SELECT emp_id, name, manager_emp_id, photo_path, is_admin, skip_details FROM employees ORDER BY name").fetchall()
+    return rows
+
+def record_attendance(conn, emp_id, date_str, in_time, out_time, status, notes):
+    cur = conn.cursor()
+    try:
+        cur.execute("""INSERT OR REPLACE INTO attendance (emp_id, date, in_time, out_time, status, notes)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (emp_id, date_str, in_time, out_time, status, notes))
+        conn.commit()
+        return True, "Attendance recorded"
+    except Exception as e:
+        return False, str(e)
+
+def get_attendance_for_emp(conn, emp_id, start=None, end=None):
+    cur = conn.cursor()
+    if start and end:
+        rows = cur.execute("SELECT * FROM attendance WHERE emp_id=? AND date BETWEEN ? AND ? ORDER BY date DESC",
+                           (emp_id, start, end)).fetchall()
+    else:
+        rows = cur.execute("SELECT * FROM attendance WHERE emp_id=? ORDER BY date DESC", (emp_id,)).fetchall()
+    return rows
+
+def add_talent_review(conn, emp_id, period, reviewer, rating, comments):
+    cur = conn.cursor()
+    cur.execute("""INSERT INTO talent_reviews (emp_id, period, reviewer_emp_id, rating, comments, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (emp_id, period, reviewer, rating, comments, datetime.now().isoformat()))
+    conn.commit()
+
+def list_talent_reviews(conn, emp_id=None):
+    cur = conn.cursor()
+    if emp_id:
+        rows = cur.execute("SELECT * FROM talent_reviews WHERE emp_id=? ORDER BY created_at DESC", (emp_id,)).fetchall()
+    else:
+        rows = cur.execute("SELECT * FROM talent_reviews ORDER BY created_at DESC").fetchall()
+    return rows
+
+def apply_leave(conn, emp_id, start_date, end_date, leave_type, comments):
+    cur = conn.cursor()
+    cur.execute("""INSERT INTO leaves (emp_id, start_date, end_date, leave_type, status, approver_emp_id, comments, applied_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (emp_id, start_date, end_date, leave_type, "Pending", "", comments, datetime.now().isoformat()))
+    conn.commit()
+
+def list_leaves(conn, emp_id=None):
+    cur = conn.cursor()
+    if emp_id:
+        rows = cur.execute("SELECT * FROM leaves WHERE emp_id=? ORDER BY applied_at DESC", (emp_id,)).fetchall()
+    else:
+        rows = cur.execute("SELECT * FROM leaves ORDER BY applied_at DESC").fetchall()
+    return rows
+
+def update_leave_status(conn, leave_id, status, approver_emp_id):
+    cur = conn.cursor()
+    cur.execute("UPDATE leaves SET status=?, approver_emp_id=? WHERE id=?", (status, approver_emp_id, leave_id))
+    conn.commit()
+
+def add_feedback(conn, emp_id, stakeholder, feedback_text, feedback_date):
+    cur = conn.cursor()
+    cur.execute("""INSERT INTO feedback (emp_id, stakeholder, feedback_text, feedback_date)
+                   VALUES (?, ?, ?, ?)""", (emp_id, stakeholder, feedback_text, feedback_date))
+    conn.commit()
+
+def list_feedback(conn, emp_id=None):
+    cur = conn.cursor()
+    if emp_id:
+        rows = cur.execute("SELECT * FROM feedback WHERE emp_id=? ORDER BY feedback_date DESC", (emp_id,)).fetchall()
+    else:
+        rows = cur.execute("SELECT * FROM feedback ORDER BY feedback_date DESC").fetchall()
+    return rows
+
+# ---------- AUTH ----------
+def authenticate(conn, emp_id, password):
+    cur = conn.cursor()
+    r = cur.execute("SELECT * FROM employees WHERE emp_id=?", (emp_id,)).fetchone()
+    if not r:
+        return False, None, "No such user"
+    stored_hash = r["password_hash"]
+    if stored_hash is None:
+        return True, r, "No password set. Logged in (insecure)!"
+    if hash_password(password) == stored_hash:
+        return True, r, "Authenticated"
+    else:
+        return False, None, "Wrong password"
+
+# ---------- UI ----------
+def show_employee_card(row):
+    name = row["name"]
+    emp_id = row["emp_id"]
+    manager = row["manager_emp_id"]
+    skip = row["skip_details"]
+    photo_path = row["photo_path"]
+    cols = st.columns([1,3])
+    with cols[0]:
+        if photo_path and os.path.exists(photo_path):
+            st.image(photo_path, use_column_width=True)
+        else:
+            st.write("No photo")
+    with cols[1]:
+        st.markdown(f"**{name}**  \nEmp ID: `{emp_id}`  \nManager: `{manager}`  \nSkip details: {skip}")
+
+def df_from_rows(rows):
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame([dict(row) for row in rows])
+
+def download_link(df, filename="export.csv"):
+    csv = df.to_csv(index=False)
+    b64 = base64.b64encode(csv.encode()).decode()
+    href = f'<a href="data:file/csv;base64,{b64}" download="{filename}">Download CSV</a>'
+    return href
+
+# ---------- STREAMLIT APP ----------
+def main():
+    st.set_page_config(page_title="Employee Management", layout="wide")
+    ensure_dirs()
+    conn = get_db_conn()
+    init_db(conn)
+
+    st.title("Centralized Employee Management 🧭")
+    st.write("Use this app to update attendance, store talent reviews, leaves, and stakeholder feedback.")
+
+    # --- Login ---
+    if "user" not in st.session_state:
+        st.session_state.user = None
+
+    with st.sidebar:
+        st.header("Log in")
+        emp_id_input = st.text_input("Employee ID", value="", placeholder="e.g., emp001 or admin")
+        pwd_input = st.text_input("Password", type="password", value="")
+        if st.button("Login"):
+            ok, user_row, msg = authenticate(conn, emp_id_input.strip(), pwd_input)
+            if ok:
+                st.success(msg)
+                st.session_state.user = dict(user_row) if user_row else {"emp_id": emp_id_input}
+            else:
+                st.error(msg)
+        if st.session_state.user:
+            st.write("Logged in as:", st.session_state.user["name"], f"({st.session_state.user['emp_id']})")
+            if st.button("Logout"):
+                st.session_state.user = None
+                st.experimental_rerun()
+
+    user = st.session_state.user
+
+    # If not logged in show public view (employee list)
+    if not user:
+        st.subheader("Employee Directory (public)")
+        rows = list_employees(conn)
+        for r in rows:
+            show_employee_card(r)
+        st.info("Log in from the sidebar to edit or add data (admin can approve leaves and manage employees).")
+        return
+
+    # Logged in: determine admin
+    is_admin = int(user.get("is_admin", 0))
+
+    # Navigation
+    tabs = ["My Profile", "Attendance", "Talent Reviews", "Leaves", "Feedback", "Directory/Reports"]
+    if is_admin:
+        tabs.insert(1, "Manage Employees")
+    choice = st.sidebar.selectbox("Section", tabs)
+
+    # -------- Manage Employees (admin) --------
+    if choice == "Manage Employees":
+        st.header("Manage Employees (Admin)")
+        with st.expander("Add new employee"):
+            with st.form("add_emp"):
+                new_emp_id = st.text_input("Employee ID")
+                new_name = st.text_input("Name")
+                new_manager = st.text_input("Manager Emp ID")
+                new_skip_details = st.text_area("Skip details")
+                new_pwd = st.text_input("Set password (optional)", type="password")
+                photo_file = st.file_uploader("Upload photo (png/jpg)", type=["png","jpg","jpeg"])
+                is_admin_flag = st.checkbox("Is admin?", value=False)
+                submitted = st.form_submit_button("Create")
+                if submitted:
+                    photo_bytes = photo_file.read() if photo_file else None
+                    ok, msg = add_employee(conn, new_emp_id.strip(), new_name.strip(), photo_bytes, new_manager.strip(), new_skip_details.strip(), password=new_pwd if new_pwd else None, is_admin=1 if is_admin_flag else 0)
+                    if ok:
+                        st.success(msg)
+                    else:
+                        st.error(msg)
+
+        st.markdown("---")
+        st.subheader("Edit existing employee")
+        all_emps = list_employees(conn)
+        emp_options = [r["emp_id"] + " | " + r["name"] for r in all_emps]
+        sel = st.selectbox("Select employee to edit", [""] + emp_options)
+        if sel:
+            emp_id = sel.split("|")[0].strip()
+            emp_row = get_employee(conn, emp_id)
+            if emp_row:
+                with st.form("edit_emp"):
+                    e_name = st.text_input("Name", value=emp_row["name"])
+                    e_manager = st.text_input("Manager Emp ID", value=emp_row["manager_emp_id"] or "")
+                    e_skip = st.text_area("Skip details", value=emp_row["skip_details"] or "")
+                    e_pwd = st.text_input("New password (leave blank to keep)", type="password")
+                    e_photo = st.file_uploader("Upload new photo", type=["png","jpg","jpeg"])
+                    e_is_admin = st.checkbox("Is admin?", value=bool(emp_row["is_admin"]))
+                    save = st.form_submit_button("Save changes")
+                    if save:
+                        photo_bytes = e_photo.read() if e_photo else None
+                        ok, msg = update_employee(conn, emp_id, name=e_name, photo_bytes=photo_bytes, manager_emp_id=e_manager, skip_details=e_skip, password=e_pwd if e_pwd else None, is_admin=1 if e_is_admin else 0)
+                        if ok:
+                            st.success(msg)
+                        else:
+                            st.error(msg)
+                st.markdown("**Profile preview**")
+                show_employee_card(emp_row)
+
+    # -------- My Profile --------
+    if choice == "My Profile":
+        st.header("My Profile")
+        emp = get_employee(conn, user["emp_id"])
+        show_employee_card(emp)
+        st.markdown("### Update basic details")
+        with st.form("update_me"):
+            name = st.text_input("Name", value=emp["name"])
+            manager = st.text_input("Manager Emp ID", value=emp["manager_emp_id"] or "")
+            skip = st.text_area("Skip details", value=emp["skip_details"] or "")
+            pwd = st.text_input("Change password (optional)", type="password")
+            photo = st.file_uploader("Update photo", type=["png","jpg","jpeg"])
+            submitted = st.form_submit_button("Save")
+            if submitted:
+                photo_bytes = photo.read() if photo else None
+                ok, msg = update_employee(conn, user["emp_id"], name=name, photo_bytes=photo_bytes, manager_emp_id=manager, skip_details=skip, password=pwd if pwd else None)
+                if ok:
+                    st.success("Profile updated")
+                else:
+                    st.error(msg)
+
+    # -------- Attendance --------
+    if choice == "Attendance":
+        st.header("Attendance")
+        st.write("Mark or view attendance.")
+        target_emp = user["emp_id"] if not is_admin else st.selectbox("Select employee", [r["emp_id"] for r in list_employees(conn)], index=0)
+        col1, col2 = st.columns(2)
+        with col1:
+            st.subheader("Mark attendance")
+            att_date = st.date_input("Date", value=date.today())
+            in_time = st.time_input("In time", value=datetime.now().time())
+            out_time = st.time_input("Out time", value=datetime.now().time())
+            status = st.selectbox("Status", ["Present", "Absent", "WFH", "On Leave"])
+            notes = st.text_input("Notes")
+            if st.button("Save attendance"):
+                ok, msg = record_attendance(conn, target_emp, att_date.isoformat(), in_time.strftime("%H:%M:%S"), out_time.strftime("%H:%M:%S"), status, notes)
+                if ok:
+                    st.success(msg)
+                else:
+                    st.error(msg)
+        with col2:
+            st.subheader("View attendance")
+            start = st.date_input("Start date", value=date.today().replace(day=1))
+            end = st.date_input("End date", value=date.today())
+            if st.button("Load"):
+                rows = get_attendance_for_emp(conn, target_emp, start.isoformat(), end.isoformat())
+                df = df_from_rows(rows)
+                if df.empty:
+                    st.info("No records")
+                else:
+                    st.dataframe(df)
+                    st.markdown(download_link(df, f"attendance_{target_emp}.csv"), unsafe_allow_html=True)
+
+    # -------- Talent Reviews --------
+    if choice == "Talent Reviews":
+        st.header("Talent Reviews")
+        st.subheader("Add review")
+        reviewer = user["emp_id"]
+        with st.form("add_review"):
+            victim_emp = st.selectbox("Employee", [r["emp_id"] + " | " + r["name"] for r in list_employees(conn)])
+            victim_id = victim_emp.split("|")[0].strip()
+            period = st.text_input("Period (e.g., Q3 2025)")
+            rating = st.slider("Rating (1-10)", 1, 10, 7)
+            comments = st.text_area("Comments")
+            sub = st.form_submit_button("Submit review")
+            if sub:
+                add_talent_review(conn, victim_id, period, reviewer, rating, comments)
+                st.success("Review submitted")
+
+        st.subheader("View reviews")
+        emp_filter = st.selectbox("Filter by employee", ["All"] + [r["emp_id"] + " | " + r["name"] for r in list_employees(conn)])
+        if st.button("Load reviews"):
+            if emp_filter == "All":
+                rows = list_talent_reviews(conn)
+            else:
+                rows = list_talent_reviews(conn, emp_filter.split("|")[0].strip())
+            df = df_from_rows(rows)
+            st.dataframe(df)
+            if not df.empty:
+                st.markdown(download_link(df, "talent_reviews.csv"), unsafe_allow_html=True)
+
+    # -------- Leaves --------
+    if choice == "Leaves":
+        st.header("Leaves")
+        if st.checkbox("Apply for leave"):
+            with st.form("apply_leave"):
+                start = st.date_input("Start date", value=date.today())
+                end = st.date_input("End date", value=date.today())
+                leave_type = st.selectbox("Leave type", ["Casual", "Sick", "Paid", "Unpaid", "Other"])
+                comments = st.text_area("Comments")
+                submitted = st.form_submit_button("Apply")
+                if submitted:
+                    apply_leave(conn, user["emp_id"], start.isoformat(), end.isoformat(), leave_type, comments)
+                    st.success("Leave applied (Pending approval)")
+
+        st.markdown("---")
+        st.subheader("View leaves")
+        if is_admin:
+            rows = list_leaves(conn)
+        else:
+            rows = list_leaves(conn, user["emp_id"])
+        df = df_from_rows(rows)
+        st.dataframe(df)
+        if is_admin and not df.empty:
+            st.markdown("### Approve / Reject leaves")
+            leave_id = st.number_input("Leave ID to process", min_value=1, step=1)
+            action = st.selectbox("Action", ["Approve", "Reject"])
+            if st.button("Process"):
+                update_leave_status(conn, int(leave_id), action, user["emp_id"])
+                st.success(f"{action}d leave {leave_id}")
+
+    # -------- Feedback --------
+    if choice == "Feedback":
+        st.header("Stakeholder Feedback")
+        with st.form("feedback_form"):
+            about_emp = st.selectbox("Employee", [r["emp_id"] + " | " + r["name"] for r in list_employees(conn)])
+            about_id = about_emp.split("|")[0].strip()
+            stakeholder = st.text_input("Stakeholder name / role")
+            feedback_text = st.text_area("Feedback")
+            f_date = st.date_input("Date", value=date.today())
+            submitted = st.form_submit_button("Submit feedback")
+            if submitted:
+                add_feedback(conn, about_id, stakeholder, feedback_text, f_date.isoformat())
+                st.success("Feedback saved")
+        st.markdown("---")
+        st.subheader("View feedback")
+        if is_admin:
+            rows = list_feedback(conn)
+        else:
+            rows = list_feedback(conn, user["emp_id"])
+        df = df_from_rows(rows)
+        st.dataframe(df)
+        if not df.empty:
+            st.markdown(download_link(df, "feedback.csv"), unsafe_allow_html=True)
+
+    # -------- Directory / Reports --------
+    if choice == "Directory/Reports":
+        st.header("Directory & Reports")
+        rows = list_employees(conn)
+        df = pd.DataFrame([{"emp_id": r["emp_id"], "name": r["name"], "manager": r["manager_emp_id"], "is_admin": r["is_admin"]} for r in rows])
+        st.dataframe(df)
+        st.markdown(download_link(df, "employees.csv"), unsafe_allow_html=True)
+
+        st.markdown("---")
+        st.subheader("Cross-report: attendance summary (last 30 days)")
+        thirty = (date.today()).isoformat()
+        start_30 = (date.today()).isoformat()
+        # Simple summary across employees
+        att_rows = conn.execute("SELECT emp_id, date, status FROM attendance WHERE date >= ? ORDER BY emp_id, date DESC", ((date.today().replace(day=max(1,date.today().day-30))).isoformat(),)).fetchall()
+        if att_rows:
+            att_df = pd.DataFrame([dict(r) for r in att_rows])
+            st.dataframe(att_df)
+        else:
+            st.info("No attendance data for the selected period.")
+
+if __name__ == "__main__":
+    main()
